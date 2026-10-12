@@ -405,7 +405,6 @@ export default function App() {
               ))}
             </div>
           )}
-          <p className="legal">Solo descarga contenido propio o con permiso. Respeta los derechos de autor.</p>
         </section>
 
         <section className="steps">
