@@ -469,7 +469,7 @@ export default function App() {
 
       <footer className="footer">
         <div className="container footer-inner">
-          <p><strong>Descargalo</strong> · Hecho con Python + React. Úsalo solo con contenido que tengas derecho a descargar.</p>
+          <p><strong>Descargalo</strong> · Hecho con Python + React.</p>
         </div>
       </footer>
     </div>
