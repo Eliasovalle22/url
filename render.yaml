@@ -1,0 +1,23 @@
+# Despliegue en Render.com (recomendado: levanta API + web juntas).
+# Conecta tu repo y Render detecta este archivo automáticamente.
+services:
+  - type: web
+    name: descargalo-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./backend/Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: PORT
+        value: 8000
+
+  - type: web
+    name: descargalo-web
+    runtime: static
+    buildCommand: cd frontend && npm ci && VITE_API_URL=https://descargalo-api.onrender.com npm run build
+    staticPublishPath: frontend/dist
+    # NOTA: cambia descargalo-api por el nombre real que le pongas a tu API
+    # si Render le asigna otra URL.
+    envVars:
+      - key: VITE_API_URL
+        value: https://descargalo-api.onrender.com

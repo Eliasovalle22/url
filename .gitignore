@@ -1,0 +1,30 @@
+# Dependencias
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env/
+pip-log.txt
+
+# Builds
+dist/
+frontend/dist/
+*.local
+
+# Env (sí subir .env.example, no los reales)
+.env
+.env.local
+.env.*.local
+frontend/.env
+frontend/.env.local
+
+# Sistema / editores
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.log
+*.tmp
