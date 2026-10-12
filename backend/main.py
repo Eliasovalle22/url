@@ -94,6 +94,37 @@ def _human_size(n) -> str:
     return f"{n:.1f} TB"
 
 
+def _friendly_extract_error(url: str, e: Exception) -> str:
+    lower_url = (url or "").lower()
+    msg = str(e).lower()
+    # Caso típico: el usuario copió la URL ya redirigida al login
+    # (facebook.com/login/?next=...story.php...share/v/...)
+    if "facebook.com/login" in lower_url:
+        return (
+            "Pegaste la página de login de Facebook, no el video. "
+            "Copia el enlace original del video (facebook.com/watch o /share/v/...) "
+            "y asegúrate de que sea público."
+        )
+    if "facebook" in lower_url and (
+        "login" in msg or "unsupported url" in msg or "cookies" in msg
+    ):
+        return (
+            "Facebook exige iniciar sesión para ese video. "
+            "Solo funcionan videos públicos: abre el video sin sesión "
+            "y copia ese enlace (watch o share)."
+        )
+    if "login" in msg or "log in" in msg or "cookies" in msg:
+        return "Ese contenido requiere iniciar sesión. Usa un enlace público."
+    if "private" in msg:
+        return "Ese video es privado. Solo funcionan enlaces públicos."
+    if "unsupported url" in msg:
+        return (
+            "Ese enlace no es un video directo (parece una página de login o redirección). "
+            "Pega el enlace original del video."
+        )
+    return f"No pudimos leer ese enlace: {e}"
+
+
 def _extract_info(url: str) -> dict:
     """Extrae metadata sin descargar. Si es playlist, toma el primer item."""
     opts = {**_base_opts(), "skip_download": True}
@@ -101,7 +132,7 @@ def _extract_info(url: str) -> dict:
         with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore
             data = ydl.extract_info(url, download=False)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=422, detail=f"No pudimos leer ese enlace: {e}") from e
+        raise HTTPException(status_code=422, detail=_friendly_extract_error(url, e)) from e
     if data is None:
         raise HTTPException(status_code=422, detail="No se encontró contenido en ese enlace.")
     if data.get("_type") == "playlist":
