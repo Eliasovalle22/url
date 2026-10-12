@@ -10,12 +10,16 @@ Endpoints:
   GET  /api/download           -> descarga directa legacy (sin progreso)
 """
 
+import os
 import re
+import shutil
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,7 +37,7 @@ app = FastAPI(title="Descargalo API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -44,6 +48,20 @@ TMPDIR.mkdir(parents=True, exist_ok=True)
 
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
+
+# --- Límites configurables por entorno (Render: Environment -> Add) ---
+MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))  # cola: solo N descargas a la vez
+MAX_JOBS = int(os.getenv("MAX_JOBS", "50"))  # tope de trabajos en memoria
+JOB_TTL_SEC = int(os.getenv("JOB_TTL_SEC", "1800"))  # 30 min: luego se borra trabajo + archivo
+INFO_CACHE_TTL = int(os.getenv("INFO_CACHE_TTL", "600"))  # 10 min de caché para /api/info
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "500"))  # archivos más grandes se rechazan
+MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+
+_job_slots = threading.Semaphore(MAX_CONCURRENT_JOBS if MAX_CONCURRENT_JOBS > 0 else 1)
+
+# Caché simple de metadata: url -> (timestamp, data cruda de yt-dlp)
+_info_cache: dict[str, tuple[float, dict]] = {}
+_info_cache_lock = threading.Lock()
 
 
 class InfoRequest(BaseModel):
@@ -56,10 +74,44 @@ class JobRequest(BaseModel):
     quality: str = "best"
 
 
+_BLOCKED_HOSTS = (
+    "localhost", "metadata.google.internal", "metadata.google",
+    "169.254.169.254",  # metadata AWS/GCP/Azure
+)
+
+
+def _is_blocked_host(host: str) -> bool:
+    h = (host or "").lower().strip().rstrip(".")
+    if not h:
+        return True
+    if h in _BLOCKED_HOSTS or h.endswith(".local") or h.endswith(".internal"):
+        return True
+    if h.startswith("127.") or h == "::1":
+        return True
+    if h.startswith("10.") or h.startswith("192.168."):
+        return True
+    if h.startswith("172."):
+        try:
+            second = int(h.split(".")[1])
+            if 16 <= second <= 31:
+                return True
+        except (IndexError, ValueError):
+            pass
+    return False
+
+
 def _check_url(url: str) -> str:
     url = (url or "").strip()
     if not url or not URL_RE.match(url):
         raise HTTPException(status_code=400, detail="Pega un enlace válido que empiece con http:// o https://")
+    if len(url) > 2000:
+        raise HTTPException(status_code=400, detail="Ese enlace es demasiado largo.")
+    try:
+        host = urlparse(url).hostname or ""
+    except Exception:
+        raise HTTPException(status_code=400, detail="Pega un enlace válido que empiece con http:// o https://")
+    if _is_blocked_host(host):
+        raise HTTPException(status_code=400, detail="Ese enlace no está permitido.")
     if yt_dlp is None:
         raise HTTPException(status_code=500, detail="Falta instalar dependencias: pip install -r requirements.txt")
     return url
@@ -72,6 +124,7 @@ def _base_opts() -> dict:
         "noplaylist": True,
         "socket_timeout": 15,
         "retries": 2,
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
     }
 
 
@@ -125,8 +178,13 @@ def _friendly_extract_error(url: str, e: Exception) -> str:
     return f"No pudimos leer ese enlace: {e}"
 
 
-def _extract_info(url: str) -> dict:
+def _extract_info(url: str, use_cache: bool = True) -> dict:
     """Extrae metadata sin descargar. Si es playlist, toma el primer item."""
+    if use_cache:
+        with _info_cache_lock:
+            hit = _info_cache.get(url)
+            if hit and (time.time() - hit[0] < INFO_CACHE_TTL):
+                return hit[1]
     opts = {**_base_opts(), "skip_download": True}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore
@@ -140,6 +198,13 @@ def _extract_info(url: str) -> dict:
         if not entries:
             raise HTTPException(status_code=422, detail="Esa playlist no tiene videos accesibles.")
         data = entries[0]
+    if use_cache:
+        with _info_cache_lock:
+            _info_cache[url] = (time.time(), data)
+            # Evita crecimiento sin control: máximo 200 entradas
+            if len(_info_cache) > 200:
+                oldest = min(_info_cache, key=lambda k: _info_cache[k][0])
+                _info_cache.pop(oldest, None)
     return data
 
 
@@ -217,91 +282,187 @@ def _run_job(job_id: str):
         job = jobs.get(job_id)
         if not job:
             return
-        job["status"] = "downloading"
         url, kind, quality = job["url"], job["kind"], job["quality"]
 
-    jobdir = TMPDIR / job_id
-    jobdir.mkdir(parents=True, exist_ok=True)
-    outtmpl = str(jobdir / "%(title).80s.%(ext)s")
-
-    def hook(d: dict):
-        if d.get("status") != "downloading":
-            return
-        total = d.get("total_bytes") or d.get("total_bytes_estimate")
-        done = d.get("downloaded_bytes") or 0
+    # Cola: espera turno si hay demasiadas descargas a la vez (sigue en "queued")
+    _job_slots.acquire()
+    try:
         with jobs_lock:
             j = jobs.get(job_id)
             if not j:
                 return
-            j["progress"] = round(done / total * 100, 1) if total else None
-            j["speed"] = d.get("speed")
-            j["eta"] = d.get("eta")
+            j["status"] = "downloading"
 
-    try:
-        data = _extract_info(url)
-        with jobs_lock:
-            j = jobs.get(job_id)
-            if j:
-                j.update(
-                    title=data.get("title") or "Sin título",
-                    thumbnail=data.get("thumbnail"),
-                    uploader=data.get("uploader") or data.get("channel") or "Desconocido",
-                    durationLabel=_format_duration(data.get("duration")),
+        jobdir = TMPDIR / job_id
+        jobdir.mkdir(parents=True, exist_ok=True)
+        outtmpl = str(jobdir / "%(title).80s.%(ext)s")
+
+        def hook(d: dict):
+            if d.get("status") != "downloading":
+                return
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            done = d.get("downloaded_bytes") or 0
+            with jobs_lock:
+                j = jobs.get(job_id)
+                if not j:
+                    return
+                j["progress"] = round(done / total * 100, 1) if total else None
+                j["speed"] = d.get("speed")
+                j["eta"] = d.get("eta")
+
+        try:
+            data = _extract_info(url)
+            with jobs_lock:
+                j = jobs.get(job_id)
+                if j:
+                    j.update(
+                        title=data.get("title") or "Sin título",
+                        thumbnail=data.get("thumbnail"),
+                        uploader=data.get("uploader") or data.get("channel") or "Desconocido",
+                        durationLabel=_format_duration(data.get("duration")),
+                    )
+
+            if kind == "audio":
+                ydl_opts: dict = {
+                    **_base_opts(),
+                    "format": _format_for(kind, quality),
+                    "outtmpl": outtmpl,
+                    "progress_hooks": [hook],
+                    "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+                    "postprocessor_args": ["-ar", "44100"],
+                    "prefer_ffmpeg": True,
+                }
+                ext = "mp3"
+            else:
+                ydl_opts = {
+                    **_base_opts(),
+                    "format": _format_for(kind, quality),
+                    "outtmpl": outtmpl,
+                    "progress_hooks": [hook],
+                    "merge_output_format": "mp4",
+                }
+                ext = "mp4"
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
+                info = ydl.extract_info(url, download=True)
+                downloaded = Path(ydl.prepare_filename(info)).with_suffix(f".{ext}")
+                if not downloaded.exists():
+                    candidates = sorted(jobdir.glob("*"), key=lambda p: p.stat().st_mtime)
+                    if not candidates:
+                        raise FileNotFoundError("No se generó el archivo.")
+                    downloaded = candidates[-1]
+
+            raw_title = (info.get("title") if isinstance(info, dict) else None) or "descarga"
+            safe = re.sub(r"[^\w\s\-áéíóúñü]", "", raw_title, flags=re.IGNORECASE).strip()[:60] or "descarga"
+            filename = f"{safe}.{downloaded.suffix.lstrip('.') or ext}"
+            size = downloaded.stat().st_size
+            if size > MAX_FILE_BYTES:
+                try:
+                    downloaded.unlink()
+                except OSError:
+                    pass
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Ese archivo pesa {_human_size(size)} y supera el límite de {MAX_FILE_MB} MB.",
                 )
+            with jobs_lock:
+                j = jobs.get(job_id)
+                if j:
+                    j.update(status="ready", progress=100, filename=filename,
+                             path=str(downloaded), size=size)
+        except HTTPException as e:
+            with jobs_lock:
+                j = jobs.get(job_id)
+                if j:
+                    j.update(status="error", error=e.detail)
+        except Exception as e:  # noqa: BLE001
+            with jobs_lock:
+                j = jobs.get(job_id)
+                if j:
+                    j.update(status="error", error=f"No se pudo descargar: {e}")
+    finally:
+        _job_slots.release()
 
-        if kind == "audio":
-            ydl_opts: dict = {
-                **_base_opts(),
-                "format": _format_for(kind, quality),
-                "outtmpl": outtmpl,
-                "progress_hooks": [hook],
-                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
-                "postprocessor_args": ["-ar", "44100"],
-                "prefer_ffmpeg": True,
-            }
-            ext = "mp3"
-        else:
-            ydl_opts = {
-                **_base_opts(),
-                "format": _format_for(kind, quality),
-                "outtmpl": outtmpl,
-                "progress_hooks": [hook],
-                "merge_output_format": "mp4",
-            }
-            ext = "mp4"
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
-            info = ydl.extract_info(url, download=True)
-            downloaded = Path(ydl.prepare_filename(info)).with_suffix(f".{ext}")
-            if not downloaded.exists():
-                candidates = sorted(jobdir.glob("*"), key=lambda p: p.stat().st_mtime)
-                if not candidates:
-                    raise FileNotFoundError("No se generó el archivo.")
-                downloaded = candidates[-1]
+def _remove_job_files(job_id: str, path: Optional[str]):
+    try:
+        if path:
+            p = Path(path)
+            if p.exists():
+                p.unlink()
+        d = TMPDIR / job_id
+        if d.exists():
+            for f in d.iterdir():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
-        raw_title = (info.get("title") if isinstance(info, dict) else None) or "descarga"
-        safe = re.sub(r"[^\w\s\-áéíóúñü]", "", raw_title, flags=re.IGNORECASE).strip()[:60] or "descarga"
-        filename = f"{safe}.{downloaded.suffix.lstrip('.') or ext}"
+
+def _cleanup_loop():
+    """Borra cada 5 min los trabajos terminados de más de JOB_TTL_SEC y su /tmp."""
+    while True:
+        time.sleep(300)
+        now = time.time()
+        expired: list[tuple[str, Optional[str]]] = []
         with jobs_lock:
-            j = jobs.get(job_id)
-            if j:
-                j.update(status="ready", progress=100, filename=filename,
-                         path=str(downloaded), size=downloaded.stat().st_size)
-    except HTTPException as e:
-        with jobs_lock:
-            j = jobs.get(job_id)
-            if j:
-                j.update(status="error", error=e.detail)
-    except Exception as e:  # noqa: BLE001
-        with jobs_lock:
-            j = jobs.get(job_id)
-            if j:
-                j.update(status="error", error=f"No se pudo descargar: {e}")
+            for jid, j in list(jobs.items()):
+                if j.get("status") in ("ready", "error") and now - j.get("created_at", now) > JOB_TTL_SEC:
+                    expired.append((jid, j.get("path")))
+                    jobs.pop(jid, None)
+            known = set(jobs)
+        for jid, path in expired:
+            _remove_job_files(jid, path)
+        # Limpia carpetas huérfanas (p. ej. /api/download legacy) más viejas que el TTL
+        try:
+            for d in TMPDIR.iterdir():
+                if not d.is_dir() or d.name in known:
+                    continue
+                try:
+                    if now - d.stat().st_mtime > JOB_TTL_SEC:
+                        for f in d.iterdir():
+                            try:
+                                f.unlink()
+                            except OSError:
+                                pass
+                        try:
+                            d.rmdir()
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
+_cleanup_thread = threading.Thread(target=_cleanup_loop, daemon=True)
+_cleanup_thread.start()
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "yt_dlp": yt_dlp is not None}
+    with jobs_lock:
+        active = sum(1 for j in jobs.values() if j.get("status") in ("queued", "downloading"))
+        total = len(jobs)
+    try:
+        free_mb = round(shutil.disk_usage(TMPDIR).free / 1024 / 1024)
+    except OSError:
+        free_mb = None
+    return {
+        "ok": True,
+        "yt_dlp": yt_dlp is not None,
+        "ffmpeg": shutil.which("ffmpeg") is not None,
+        "jobs": total,
+        "activeJobs": active,
+        "tmpFreeMB": free_mb,
+        "maxFileMB": MAX_FILE_MB,
+    }
 
 
 @app.post("/api/info")
@@ -327,14 +488,20 @@ def get_info(body: InfoRequest):
 def create_job(body: JobRequest):
     url = _check_url(body.url)
     kind = body.kind if body.kind in ("video", "audio") else "video"
+    quality = (body.quality or "best").strip()[:10]
     job_id = uuid.uuid4().hex[:10]
     with jobs_lock:
+        # Tope de trabajos: expulsa el más viejo terminado para no crecer sin control
+        if len(jobs) >= MAX_JOBS:
+            done = [j for j in jobs.values() if j.get("status") in ("ready", "error")]
+            victim = min(done or list(jobs.values()), key=lambda j: j.get("created_at", 0))
+            jobs.pop(victim["id"], None)
         jobs[job_id] = {
-            "id": job_id, "url": url, "kind": kind, "quality": body.quality or "best",
+            "id": job_id, "url": url, "kind": kind, "quality": quality,
             "status": "queued", "progress": 0, "speed": None, "eta": None,
             "title": None, "thumbnail": None, "uploader": None,
             "durationLabel": None, "filename": None, "path": None,
-            "size": None, "error": None,
+            "size": None, "error": None, "created_at": time.time(),
         }
         job = jobs[job_id]
     t = threading.Thread(target=_run_job, args=(job_id,), daemon=True)
@@ -370,17 +537,7 @@ def delete_job(job_id: str):
         job = jobs.pop(job_id, None)
     if not job:
         raise HTTPException(status_code=404, detail="Trabajo no encontrado.")
-    try:
-        p = Path(job["path"]) if job.get("path") else None
-        if p and p.exists():
-            p.unlink()
-        d = TMPDIR / job_id
-        if d.exists():
-            for f in d.iterdir():
-                f.unlink()
-            d.rmdir()
-    except OSError:
-        pass
+    _remove_job_files(job_id, job.get("path"))
     return {"ok": True}
 
 
@@ -432,5 +589,15 @@ def download(
 
     raw_title = (info.get("title") if isinstance(info, dict) else None) or "descarga"
     safe = re.sub(r"[^\w\s\-áéíóúñü]", "", raw_title, flags=re.IGNORECASE).strip()[:60] or "descarga"
+    if downloaded.stat().st_size > MAX_FILE_BYTES:
+        size = downloaded.stat().st_size
+        try:
+            downloaded.unlink()
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=413,
+            detail=f"Ese archivo pesa {_human_size(size)} y supera el límite de {MAX_FILE_MB} MB.",
+        )
     return FileResponse(path=str(downloaded), media_type=media_type,
                         filename=f"{safe}.{downloaded.suffix.lstrip('.') or ext}")
